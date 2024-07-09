@@ -1,0 +1,182 @@
+#include <gtk/gtk.h>
+#include <iostream>
+#include <sstream>
+#include <vector>
+#include <string>
+#include <cstdlib>
+#include <algorithm>
+#include <fstream>
+
+struct Process {
+    std::string pid;
+    std::string name;
+    std::string ram;
+};
+
+struct MemoryInfo {
+    long total;
+    long used;
+};
+
+struct RefreshData {
+    GtkListStore* list_store;
+    GtkLabel* status_label;
+};
+
+std::vector<Process> get_running_processes() {
+    std::vector<Process> processes;
+    char buffer[256];
+    std::string command = "ps -u $(whoami) -o pid=,rss=,comm=";
+    FILE* pipe = popen(command.c_str(), "r");
+    if (!pipe) {
+        std::cerr << "popen() failed!" << std::endl;
+        return processes;
+    }
+    while (fgets(buffer, sizeof buffer, pipe) != nullptr) {
+        std::stringstream ss(buffer);
+        Process process;
+        ss >> process.pid >> process.ram;
+        std::getline(ss, process.name);
+        process.name.erase(0, process.name.find_first_not_of(" \t\n\r\f\v"));
+        if (!process.pid.empty() && !process.ram.empty()) {
+            processes.push_back(process);
+        }
+    }
+    if (pclose(pipe) == -1) {
+        std::cerr << "pclose() failed!" << std::endl;
+    }
+
+    std::sort(processes.begin(), processes.end(), [](const Process &a, const Process &b) {
+        try {
+            return std::stol(a.ram) > std::stol(b.ram);
+        } catch (const std::invalid_argument&) {
+            return false;
+        }
+    });
+
+    return processes;
+}
+
+MemoryInfo get_memory_info() {
+    std::ifstream meminfo("/proc/meminfo");
+    std::string line;
+    MemoryInfo mem;
+    mem.total = 0;
+    mem.used = 0;
+
+    while (std::getline(meminfo, line)) {
+        std::istringstream iss(line);
+        std::string key;
+        long value;
+        std::string unit;
+        iss >> key >> value >> unit;
+
+        if (key == "MemTotal:") {
+            mem.total = value;
+        } else if (key == "MemAvailable:") {
+            mem.used = mem.total - value;
+        }
+    }
+    return mem;
+}
+
+std::string format_ram(const std::string& ram_kb_str) {
+    try {
+        long ram_kb = std::stol(ram_kb_str);
+        if (ram_kb >= 1024 * 1024) {
+            return std::to_string(ram_kb / (1024 * 1024)) + " GB";
+        } else if (ram_kb >= 1024) {
+            return std::to_string(ram_kb / 1024) + " MB";
+        } else {
+            return ram_kb_str + " KB";
+        }
+    } catch (const std::invalid_argument&) {
+        return ram_kb_str + " KB";
+    }
+}
+
+std::string format_memory_info(const MemoryInfo& mem) {
+    std::stringstream ss;
+    ss << "Total Memory: " << format_ram(std::to_string(mem.total)) << ", Used Memory: " << format_ram(std::to_string(mem.used));
+    return ss.str();
+}
+
+void on_refresh_button_clicked(GtkButton* button, gpointer user_data) {
+    RefreshData* data = static_cast<RefreshData*>(user_data);
+    GtkListStore* list_store = data->list_store;
+    GtkLabel* status_label = data->status_label;
+
+    gtk_list_store_clear(list_store);
+    auto processes = get_running_processes();
+    for (const auto& process : processes) {
+        GtkTreeIter iter;
+        std::string formatted_ram = format_ram(process.ram);
+        gtk_list_store_append(list_store, &iter);
+        gtk_list_store_set(list_store, &iter, 0, process.pid.c_str(), 1, process.name.c_str(), 2, formatted_ram.c_str(), -1);
+    }
+
+    MemoryInfo mem = get_memory_info();
+    std::string memory_status = format_memory_info(mem);
+    gtk_label_set_text(status_label, memory_status.c_str());
+}
+
+void on_kill_button_clicked(GtkButton* button, GtkTreeView* tree_view) {
+    GtkTreeSelection* selection = gtk_tree_view_get_selection(tree_view);
+    GtkTreeModel* model;
+    GtkTreeIter iter;
+    if (gtk_tree_selection_get_selected(selection, &model, &iter)) {
+        gchar* pid;
+        gtk_tree_model_get(model, &iter, 0, &pid, -1);
+        std::string command = "kill " + std::string(pid);
+        system(command.c_str());
+        g_free(pid);
+    }
+}
+
+int main(int argc, char *argv[]) {
+    gtk_init(&argc, &argv);
+
+    GtkWidget* window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(window), "Task Manager");
+    gtk_window_set_default_size(GTK_WINDOW(window), 600, 400);
+    g_signal_connect(window, "destroy", G_CALLBACK(gtk_main_quit), nullptr);
+
+    GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_container_add(GTK_CONTAINER(window), vbox);
+
+    GtkWidget* scrolled_window = gtk_scrolled_window_new(nullptr, nullptr);
+    gtk_widget_set_vexpand(scrolled_window, TRUE);
+    gtk_widget_set_hexpand(scrolled_window, TRUE);
+    gtk_box_pack_start(GTK_BOX(vbox), scrolled_window, TRUE, TRUE, 0);
+
+    GtkListStore* list_store = gtk_list_store_new(3, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
+    GtkWidget* tree_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(list_store));
+    gtk_container_add(GTK_CONTAINER(scrolled_window), tree_view);
+
+    GtkCellRenderer* renderer = gtk_cell_renderer_text_new();
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(tree_view), -1, "PID", renderer, "text", 0, nullptr);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(tree_view), -1, "Name", renderer, "text", 1, nullptr);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(tree_view), -1, "RAM", renderer, "text", 2, nullptr);
+
+    GtkWidget* hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_box_pack_start(GTK_BOX(vbox), hbox, FALSE, FALSE, 0);
+
+    GtkWidget* refresh_button = gtk_button_new_with_label("Refresh");
+    GtkLabel* status_label = GTK_LABEL(gtk_label_new("Memory Status"));
+    RefreshData refresh_data = {list_store, status_label};
+    g_signal_connect(refresh_button, "clicked", G_CALLBACK(on_refresh_button_clicked), &refresh_data);
+    gtk_box_pack_start(GTK_BOX(hbox), refresh_button, TRUE, TRUE, 0);
+
+    GtkWidget* kill_button = gtk_button_new_with_label("Kill Process");
+    g_signal_connect(kill_button, "clicked", G_CALLBACK(on_kill_button_clicked), tree_view);
+    gtk_box_pack_start(GTK_BOX(hbox), kill_button, TRUE, TRUE, 0);
+
+    gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(status_label), FALSE, FALSE, 0);
+
+    on_refresh_button_clicked(GTK_BUTTON(refresh_button), &refresh_data);
+
+    gtk_widget_show_all(window);
+    gtk_main();
+
+    return 0;
+}
